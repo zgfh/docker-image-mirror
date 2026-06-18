@@ -1,0 +1,13 @@
+version: '3.8'
+
+services:
+  docker-mirror:
+    build: .
+    ports:
+      - "5000:5000"
+    volumes:
+      - docker-mirror-storage:/var/lib/docker-mirror
+    restart: unless-stopped
+
+volumes:
+  docker-mirror-storage:
