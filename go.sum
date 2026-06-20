@@ -1,2 +1,2 @@
-github.com/gorilla/mux v1.8.1 h1:TuBL49tXwxGEEx6MsPmPmQBHoSH8PqAESqxPn9KwGg=
-github.com/gorilla/mux v1.8.1/go.mod h1:DVbg23sWSpwqqkBAEqfCI127QQ10y4j/7L77NTTFAM=
+github.com/google/go-containerregistry v0.21.7 h1:/vPFuVXDjtFREsVArW+0h1CIl5urnOhzei4X2DMW9IU=
+github.com/google/go-containerregistry v0.21.7/go.mod h1:kjSbt7/zMsKLWfnHrIvKvhXHUw91jbe9DNjPPJ32gXE=

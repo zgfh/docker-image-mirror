@@ -1,5 +1,5 @@
-module docker-image-mirror
+module github.com/zgfh/docker-image-mirror
 
-go 1.21
+go 1.26.3
 
-require github.com/gorilla/mux v1.8.1
+require github.com/google/go-containerregistry v0.21.7 // indirect
