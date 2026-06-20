@@ -8,6 +8,7 @@ import (
 	"log"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -25,7 +26,7 @@ var upstreamMap = map[string]string{
 
 // Proxy 结构体保存代理配置和状态
 type Proxy struct {
-	cacheURL string // 本地缓存 registry 地址，例如 http://127.0.0.1:5001
+	cacheURL string // 本地或外部缓存 registry 地址，例如 http://127.0.0.1:5001
 	client   *http.Client
 	mu       sync.Mutex
 	tokens   map[string]string // docker.io 的 token 缓存
@@ -33,30 +34,44 @@ type Proxy struct {
 
 func main() {
 	cacheAddr := ":5001"
-	proxyAddr := ":5000"
+	proxyAddr := os.Getenv("PROXY_ADDR")
+	if proxyAddr == "" {
+		proxyAddr = ":5000"
+	}
 
-	// 1. 启动内嵌的 cache registry (基于 go-containerregistry)
-	go func() {
-		log.Printf("Cache registry listening on %s\n", cacheAddr)
-		// registry.New() 提供一个标准的、内存级别的 Registry 实现
-		srv := &http.Server{
-			Addr:    cacheAddr,
-			Handler: registry.New(),
-		}
-		if err := srv.ListenAndServe(); err != nil {
-			log.Fatalf("cache registry failed: %v", err)
-		}
-	}()
+	// 读取外部缓存镜像仓库地址（如 registry.internal:5000）
+	externalCache := os.Getenv("CACHE_REGISTRY")
 
-	// 等待 cache registry 启动
-	time.Sleep(500 * time.Millisecond)
+	var cacheURL string
+
+	if externalCache != "" {
+		// 使用外部部署的缓存 registry
+		cacheURL = "http://" + externalCache
+		log.Printf("Using external cache registry: %s\n", cacheURL)
+	} else {
+		// 1. 启动内嵌的内存型 cache registry
+		go func() {
+			log.Printf("Cache registry listening on %s\n", cacheAddr)
+			srv := &http.Server{
+				Addr:    cacheAddr,
+				Handler: registry.New(),
+			}
+			if err := srv.ListenAndServe(); err != nil {
+				log.Fatalf("cache registry failed: %v", err)
+			}
+		}()
+
+		// 等待 cache registry 启动
+		time.Sleep(500 * time.Millisecond)
+		cacheURL = "http://127.0.0.1" + cacheAddr
+	}
 
 	// 2. 启动代理服务器
 	tr := &http.Transport{
 		DisableCompression: true, // 必须禁用自动解压，保证流式二进制透传
 	}
 	p := &Proxy{
-		cacheURL: "http://127.0.0.1" + cacheAddr,
+		cacheURL: cacheURL,
 		client:   &http.Client{Transport: tr},
 		tokens:   make(map[string]string),
 	}
@@ -89,10 +104,8 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Cache miss for %s/%s, fetching from upstream\n", repo, ref)
 
 	// 2. 缓存未命中，从上游拉取
-	// 如果在内置映射表中，使用映射的真实域名；否则直接把 prefix 当作域名使用
 	upstream, ok := upstreamMap[prefix]
 	if !ok {
-		// 默认将 prefix 当作上游域名 (适用于 m.daocloud.io 等自定义加速器)
 		upstream = prefix
 	}
 
@@ -129,13 +142,13 @@ func parseV2Path(path string) (prefix, repo, kind, ref string, ok bool) {
 	return "", "", "", "", false
 }
 
-// serveFromCache 尝试从本地缓存 registry 获取数据
+// serveFromCache 尝试从本地或外部缓存 registry 获取数据
 func (p *Proxy) serveFromCache(w http.ResponseWriter, r *http.Request, repo, kind, ref string) bool {
 	cachePath := fmt.Sprintf("%s/v2/%s/%s/%s", p.cacheURL, repo, kind, ref)
 	log.Printf("Checking cache for %s/%s\n", repo, ref)
 	req, _ := http.NewRequest(r.Method, cachePath, nil)
 	req.Header = r.Header.Clone()
-	req.Header.Del("Authorization") // 本地缓存不需要认证
+	req.Header.Del("Authorization") // 无账号密码的缓存仓库不需要认证
 
 	resp, err := p.client.Do(req)
 	if err != nil || resp.StatusCode != http.StatusOK {
@@ -144,12 +157,11 @@ func (p *Proxy) serveFromCache(w http.ResponseWriter, r *http.Request, repo, kin
 			resp.Body.Close()
 		}
 		log.Printf("Cache miss for %s/%s\n", repo, ref)
-		return false // 缓存未命中或出错
+		return false
 	}
 	log.Printf("Cache hit for %s/%s\n", repo, ref)
 	defer resp.Body.Close()
 
-	// 缓存命中，直接透传响应
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(resp.StatusCode)
 	io.Copy(w, resp.Body)
@@ -160,7 +172,6 @@ func (p *Proxy) serveFromCache(w http.ResponseWriter, r *http.Request, repo, kin
 func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstream, repo, kind, ref string) {
 	upstreamURL := fmt.Sprintf("https://%s/v2/%s/%s/%s", upstream, repo, kind, ref)
 
-	// 模拟标准的 Docker 客户端 User-Agent，避免某些上游拒绝请求
 	userAgent := r.Header.Get("User-Agent")
 	if userAgent == "" {
 		userAgent = "docker/20.10.0"
@@ -176,7 +187,6 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 		return
 	}
 
-	// 通用 401 认证处理
 	if resp.StatusCode == http.StatusUnauthorized {
 		wwwAuth := resp.Header.Get("WWW-Authenticate")
 		resp.Body.Close()
@@ -184,7 +194,6 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 		if wwwAuth != "" {
 			token := p.fetchToken(wwwAuth, repo)
 			if token != "" {
-				// 带上 Token 重新发起请求
 				req, _ = http.NewRequest(r.Method, upstreamURL, nil)
 				req.Header.Set("Accept", r.Header.Get("Accept"))
 				req.Header.Set("User-Agent", userAgent)
@@ -213,7 +222,6 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 		return
 	}
 
-	// 如果是 HEAD 请求，不涉及实际数据下载，直接返回 Header
 	if r.Method == http.MethodHead {
 		copyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
@@ -229,7 +237,6 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 
 // fetchToken 解析 WWW-Authenticate 头并获取 Bearer Token
 func (p *Proxy) fetchToken(wwwAuth, repo string) string {
-	// 格式示例: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
 	parts := strings.TrimPrefix(wwwAuth, "Bearer ")
 	params := map[string]string{}
 	for _, p := range strings.Split(parts, ",") {
@@ -245,7 +252,6 @@ func (p *Proxy) fetchToken(wwwAuth, repo string) string {
 		return ""
 	}
 
-	// 构造请求参数
 	q := url.Values{}
 	if service, ok := params["service"]; ok {
 		q.Set("service", service)
@@ -253,7 +259,6 @@ func (p *Proxy) fetchToken(wwwAuth, repo string) string {
 	if scope, ok := params["scope"]; ok {
 		q.Set("scope", scope)
 	} else {
-		// 如果上游没返回 scope，按标准补上
 		q.Set("scope", fmt.Sprintf("repository:%s:pull", repo))
 	}
 
@@ -274,7 +279,7 @@ func (p *Proxy) fetchToken(wwwAuth, repo string) string {
 	return data.Token
 }
 
-// handleManifestStream 处理 Manifest 请求（通常较小，直接全读入内存）
+// handleManifestStream 处理 Manifest 请求
 func (p *Proxy) handleManifestStream(w http.ResponseWriter, resp *http.Response, repo, ref string) {
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
@@ -282,37 +287,31 @@ func (p *Proxy) handleManifestStream(w http.ResponseWriter, resp *http.Response,
 		return
 	}
 
-	// 1. 返回给客户端
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
 	w.Write(body)
 	log.Printf("Served manifest %s/%s, size %d bytes\n", repo, ref, len(body))
 
-	// 2. 异步推送到 cache
 	contentType := resp.Header.Get("Content-Type")
 	log.Printf("Caching manifest %s/%s to cache\n", repo, ref)
 	go p.cacheManifest(repo, ref, contentType, body)
 }
 
-// handleBlobStream 处理 Blob (镜像层) 请求，核心流式 Tee 逻辑
+// handleBlobStream 处理 Blob 请求
 func (p *Proxy) handleBlobStream(w http.ResponseWriter, resp *http.Response, repo, digest string) {
 	copyHeaders(w.Header(), resp.Header)
 	w.WriteHeader(http.StatusOK)
 
-	// 使用 io.Pipe 实现流式 tee
 	pr, pw := io.Pipe()
 
-	// 后台 goroutine：从管道读取数据并上传到缓存
 	go func() {
 		defer pr.Close()
 		p.uploadBlobToCache(repo, digest, pr)
 	}()
 
-	// 同时写入 HTTP Response (客户端) 和 Pipe Writer (缓存上传)
 	mw := io.MultiWriter(w, pw)
 	io.Copy(mw, resp.Body)
 
-	// 数据读取完毕，关闭 writer 通知缓存上传完成
 	pw.Close()
 }
 
@@ -337,7 +336,6 @@ func (p *Proxy) cacheManifest(repo, ref, contentType string, body []byte) {
 
 // uploadBlobToCache 流式上传 Blob 到缓存仓库
 func (p *Proxy) uploadBlobToCache(repo, digest string, body io.Reader) {
-	// 1. 初始化上传会话
 	postURL := fmt.Sprintf("%s/v2/%s/blobs/uploads/", p.cacheURL, repo)
 	log.Printf("Initiating blob upload for %s/%s to cache\n", repo, digest)
 	resp, err := p.client.Post(postURL, "", nil)
@@ -358,7 +356,6 @@ func (p *Proxy) uploadBlobToCache(repo, digest string, body io.Reader) {
 	}
 	log.Printf("Initiated blob upload for %s/%s, location: %s\n", repo, digest, location)
 
-	// 2. PATCH 流式数据
 	patchReq, _ := http.NewRequest("PATCH", location, body)
 	patchReq.Header.Set("Content-Type", "application/octet-stream")
 	patchResp, err := p.client.Do(patchReq)
@@ -381,7 +378,6 @@ func (p *Proxy) uploadBlobToCache(repo, digest string, body io.Reader) {
 		nextLocation = p.cacheURL + nextLocation
 	}
 
-	// 3. PUT 完成上传
 	finalURL := nextLocation
 	if strings.Contains(finalURL, "?") {
 		finalURL += "&digest=" + digest
@@ -399,42 +395,6 @@ func (p *Proxy) uploadBlobToCache(repo, digest string, body io.Reader) {
 	log.Printf("Cached blob %s/%s to cache, status: %d\n", repo, digest, putResp.StatusCode)
 }
 
-// getDockerHubToken 获取 Docker Hub 的匿名 Bearer Token
-func (p *Proxy) getDockerHubToken(repo string) string {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	// 简单缓存
-	if t, ok := p.tokens[repo]; ok {
-		log.Printf("Using cached token for %s\n", repo)
-		return t
-	}
-
-	// docker.io 需要自动补 library/ 前缀
-	scopeRepo := repo
-	if !strings.Contains(repo, "/") {
-		scopeRepo = "library/" + repo
-	}
-
-	authURL := fmt.Sprintf("https://auth.docker.io/token?service=registry.docker.io&scope=repository:%s:pull", scopeRepo)
-	resp, err := p.client.Get(authURL)
-	if err != nil {
-		log.Printf("Failed to get Docker Hub token for %s: %v\n", repo, err)
-		return ""
-	}
-	defer resp.Body.Close()
-
-	var data struct {
-		Token string `json:"token"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
-		return ""
-	}
-
-	p.tokens[repo] = data.Token
-	return data.Token
-}
-
 // copyHeaders 安全地复制 HTTP 头
 func copyHeaders(dst, src http.Header) {
 	for k, vv := range src {
@@ -442,6 +402,5 @@ func copyHeaders(dst, src http.Header) {
 			dst.Add(k, v)
 		}
 	}
-	// 移除安全相关头，避免影响本地代理
 	dst.Del("Transfer-Encoding")
 }

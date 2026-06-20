@@ -1,5 +1,3 @@
-这里是为你生成的 `README.md` 文档，你可以直接将其保存并推送到你的 GitHub 仓库中。
----
 # Docker Image Mirror
 一个轻量级、高性能的 Docker 镜像代理与缓存服务。使用 Go 编写，单文件运行，无需额外部署重量级的 Registry 服务。
 支持通过多层级路径前缀将请求路由到任意上游 Registry（如 `docker.io`、`gcr.io`、`m.daocloud.io` 等），并提供流式透传与本地缓存加速。
@@ -42,6 +40,10 @@ cd docker-image-mirror
 go build -o docker-image-mirror
 # 运行代理服务
 ./docker-image-mirror
+
+# 或docker方式
+# 运行容器
+docker run -d --name docker-image-mirror -p 5000:5000 ghcr.io/zgfh/docker-image-mirror:latest
 ```
 默认情况下：
 - 代理服务监听在 `:5000` 端口。
