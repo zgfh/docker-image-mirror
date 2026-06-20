@@ -7,6 +7,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -158,26 +159,50 @@ func (p *Proxy) serveFromCache(w http.ResponseWriter, r *http.Request, repo, kin
 // serveFromUpstream 从上游拉取数据，流式返回客户端，同时推送到缓存
 func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstream, repo, kind, ref string) {
 	upstreamURL := fmt.Sprintf("https://%s/v2/%s/%s/%s", upstream, repo, kind, ref)
+
+	// 模拟标准的 Docker 客户端 User-Agent，避免某些上游拒绝请求
+	userAgent := r.Header.Get("User-Agent")
+	if userAgent == "" {
+		userAgent = "docker/20.10.0"
+	}
+
 	req, _ := http.NewRequest(r.Method, upstreamURL, nil)
+	req.Header.Set("Accept", r.Header.Get("Accept"))
+	req.Header.Set("User-Agent", userAgent)
 
-	// 传递 Accept 头
-	if accept := r.Header.Get("Accept"); accept != "" {
-		req.Header.Set("Accept", accept)
-	}
-
-	// 处理 Docker Hub 的认证
-	if upstream == "registry-1.docker.io" {
-		token := p.getDockerHubToken(repo)
-		if token != "" {
-			req.Header.Set("Authorization", "Bearer "+token)
-		}
-	}
-	log.Printf("Requesting upstream %s/%s\n", repo, ref)
 	resp, err := p.client.Do(req)
 	if err != nil {
 		http.Error(w, "upstream request failed: "+err.Error(), http.StatusBadGateway)
-		log.Printf("Upstream request failed for %s/%s: %v\n", repo, ref, err)
 		return
+	}
+
+	// 通用 401 认证处理
+	if resp.StatusCode == http.StatusUnauthorized {
+		wwwAuth := resp.Header.Get("WWW-Authenticate")
+		resp.Body.Close()
+
+		if wwwAuth != "" {
+			token := p.fetchToken(wwwAuth, repo)
+			if token != "" {
+				// 带上 Token 重新发起请求
+				req, _ = http.NewRequest(r.Method, upstreamURL, nil)
+				req.Header.Set("Accept", r.Header.Get("Accept"))
+				req.Header.Set("User-Agent", userAgent)
+				req.Header.Set("Authorization", "Bearer "+token)
+
+				resp, err = p.client.Do(req)
+				if err != nil {
+					http.Error(w, "upstream retry failed: "+err.Error(), http.StatusBadGateway)
+					return
+				}
+			} else {
+				http.Error(w, "failed to fetch auth token", http.StatusUnauthorized)
+				return
+			}
+		} else {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
 	}
 	defer resp.Body.Close()
 
@@ -185,7 +210,6 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 		copyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		io.Copy(w, resp.Body)
-		log.Printf("Upstream returned non-200 for %s/%s: %d\n", repo, ref, resp.StatusCode)
 		return
 	}
 
@@ -193,7 +217,6 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 	if r.Method == http.MethodHead {
 		copyHeaders(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
-		log.Printf("Served HEAD request for %s/%s\n", repo, ref)
 		return
 	}
 
@@ -202,6 +225,53 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 	} else if kind == "blobs" {
 		p.handleBlobStream(w, resp, repo, ref)
 	}
+}
+
+// fetchToken 解析 WWW-Authenticate 头并获取 Bearer Token
+func (p *Proxy) fetchToken(wwwAuth, repo string) string {
+	// 格式示例: Bearer realm="https://auth.docker.io/token",service="registry.docker.io",scope="repository:library/alpine:pull"
+	parts := strings.TrimPrefix(wwwAuth, "Bearer ")
+	params := map[string]string{}
+	for _, p := range strings.Split(parts, ",") {
+		if idx := strings.Index(p, "="); idx != -1 {
+			key := strings.TrimSpace(p[:idx])
+			val := strings.Trim(p[idx+1:], "\"")
+			params[key] = val
+		}
+	}
+
+	realm := params["realm"]
+	if realm == "" {
+		return ""
+	}
+
+	// 构造请求参数
+	q := url.Values{}
+	if service, ok := params["service"]; ok {
+		q.Set("service", service)
+	}
+	if scope, ok := params["scope"]; ok {
+		q.Set("scope", scope)
+	} else {
+		// 如果上游没返回 scope，按标准补上
+		q.Set("scope", fmt.Sprintf("repository:%s:pull", repo))
+	}
+
+	tokenURL := realm + "?" + q.Encode()
+	resp, err := p.client.Get(tokenURL)
+	if err != nil {
+		log.Printf("fetch token failed: %v", err)
+		return ""
+	}
+	defer resp.Body.Close()
+
+	var data struct {
+		Token string `json:"token"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return ""
+	}
+	return data.Token
 }
 
 // handleManifestStream 处理 Manifest 请求（通常较小，直接全读入内存）
