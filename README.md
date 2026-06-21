@@ -41,9 +41,14 @@ go build -o docker-image-mirror
 # 运行代理服务
 ./docker-image-mirror
 
-# 或docker方式
-# 运行容器
+# 或docker方式运行容器
 docker run -d --name docker-image-mirror -p 5000:5000 ghcr.io/zgfh/docker-image-mirror:latest
+
+# 或docker-compose方式运行容器
+docker-compose up -d
+
+# 或k8s方式运行容器
+kubectl apply -f k8s.yaml
 ```
 默认情况下：
 - 代理服务监听在 `:5000` 端口。

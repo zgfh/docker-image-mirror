@@ -1,13 +1,28 @@
 version: '3.8'
 
 services:
-  docker-mirror:
-    build: .
+  # 1. 镜像代理服务
+  docker-image-mirror:
+    image: ghcr.io/zgfh/docker-image-mirror:latest
+    container_name: docker-image-mirror
     ports:
       - "5000:5000"
-    volumes:
-      - docker-mirror-storage:/var/lib/docker-mirror
+    environment:
+      - PROXY_ADDR=:5000
+      # 指向 compose 内的 registry 服务，使用服务名作为主机名
+      - CACHE_REGISTRY=registry:5001
+    depends_on:
+      - registry
     restart: unless-stopped
 
-volumes:
-  docker-mirror-storage:
+  # 2. 缓存镜像仓库服务
+  registry:
+    image: registry:2
+    container_name: docker-image-mirror-cache
+    environment:
+      - REGISTRY_HTTP_ADDR=0.0.0.0:5001
+      - REGISTRY_HTTP_SECRET=a-secret-for-registry
+    volumes:
+      # 宿主机目录映射，自动创建
+      - /data/docker-image-mirror/cache:/var/lib/registry
+    restart: unless-stopped

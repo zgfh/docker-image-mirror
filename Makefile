@@ -1,7 +1,7 @@
 .PHONY: build run docker-build docker-run docker-stop
 
 build:
-	go build -o bin/server ./cmd/server
+	go build -o bin/server .
 
 run: build
 	./bin/server
