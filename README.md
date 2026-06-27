@@ -79,6 +79,38 @@ docker pull 192.168.1.104:5000/registry.cn-hangzhou.aliyuncs.com/google_containe
 **缓存验证**：
 当你第一次拉取某个镜像时，观察代理程序日志会显示从上游拉取并推送到缓存的过程。
 当你第二次拉取相同镜像时，日志会显示 `Cache hit`，且拉取速度极快。
+## ⚙️ 环境变量
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `PROXY_ADDR` | `:5000` | 代理服务监听地址 |
+| `CACHE_REGISTRY` | (空) | 外部缓存 Registry 地址（如 `registry:5001`），为空则使用内嵌内存型 Registry |
+| `MIRROR_PROXY` | (空) | 访问上游 Registry 时使用的代理地址（如 `http://proxy:8080`） |
+| `MIRROR_NO_PROXY` | (空) | 不走代理的上游 Registry 列表，逗号分隔（如 `docker.io,quay.io`） |
+
+### 代理配置说明
+
+`MIRROR_PROXY` 用于配置访问上游 Registry 时使用的 HTTP(S) 代理。`MIRROR_NO_PROXY` 用于指定哪些上游 Registry 不走代理。
+
+**匹配规则：**
+- 精确匹配：`docker.io` 只匹配 `docker.io`
+- 后缀匹配：`.docker.io` 匹配所有 `*.docker.io` 的子域名
+
+**示例：**
+```bash
+# 所有上游请求都通过代理
+export MIRROR_PROXY=http://192.168.1.1:7890
+
+# 除 docker.io 外，其他上游都走代理
+export MIRROR_PROXY=http://192.168.1.1:7890
+export MIRROR_NO_PROXY=docker.io,quay.io
+
+# 运行代理服务
+./docker-image-mirror
+```
+
+**注意：** 代理仅用于访问上游 Registry，缓存 Registry 的读写始终直连，不受代理影响。
+
 ## ⚙️ 高级说明
 ### 路径解析规则
 代理程序严格遵循 OCI Distribution Spec 解析路径：

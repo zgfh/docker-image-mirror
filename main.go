@@ -26,10 +26,11 @@ var upstreamMap = map[string]string{
 
 // Proxy 结构体保存代理配置和状态
 type Proxy struct {
-	cacheURL string // 本地或外部缓存 registry 地址，例如 http://127.0.0.1:5001
-	client   *http.Client
-	mu       sync.Mutex
-	tokens   map[string]string // docker.io 的 token 缓存
+	cacheURL       string // 本地或外部缓存 registry 地址，例如 http://127.0.0.1:5001
+	client         *http.Client
+	upstreamClient *http.Client // 访问上游 registry 的客户端（可配置代理）
+	mu             sync.Mutex
+	tokens         map[string]string // docker.io 的 token 缓存
 }
 
 func main() {
@@ -66,14 +67,45 @@ func main() {
 		cacheURL = "http://127.0.0.1" + cacheAddr
 	}
 
-	// 2. 启动代理服务器
-	tr := &http.Transport{
+	// 2. 配置上游代理
+	mirrorProxy := os.Getenv("MIRROR_PROXY")
+	mirrorNoProxy := os.Getenv("MIRROR_NO_PROXY")
+
+	var proxyFunc func(*http.Request) (*url.URL, error)
+	if mirrorProxy != "" {
+		proxyURL, err := url.Parse(mirrorProxy)
+		if err != nil {
+			log.Fatalf("Invalid MIRROR_PROXY: %v", err)
+		}
+		noProxyList := parseNoProxy(mirrorNoProxy)
+
+		proxyFunc = func(req *http.Request) (*url.URL, error) {
+			host := req.URL.Hostname()
+			for _, np := range noProxyList {
+				if matchNoProxy(host, np) {
+					log.Printf("Bypass proxy for %s (matches NO_PROXY: %s)\n", host, np)
+					return nil, nil // 直连
+				}
+			}
+			log.Printf("Using proxy %s for %s\n", proxyURL.Host, host)
+			return proxyURL, nil
+		}
+		log.Printf("Mirror proxy enabled: %s (no_proxy: %s)\n", proxyURL.Host, mirrorNoProxy)
+	}
+
+	// 3. 启动代理服务器
+	cacheTr := &http.Transport{
 		DisableCompression: true, // 必须禁用自动解压，保证流式二进制透传
 	}
+	upstreamTr := &http.Transport{
+		DisableCompression: true,
+		Proxy:              proxyFunc,
+	}
 	p := &Proxy{
-		cacheURL: cacheURL,
-		client:   &http.Client{Transport: tr},
-		tokens:   make(map[string]string),
+		cacheURL:       cacheURL,
+		client:         &http.Client{Transport: cacheTr},
+		upstreamClient: &http.Client{Transport: upstreamTr},
+		tokens:         make(map[string]string),
 	}
 
 	log.Printf("Docker image proxy listening on %s\n", proxyAddr)
@@ -181,7 +213,7 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 	req.Header.Set("Accept", r.Header.Get("Accept"))
 	req.Header.Set("User-Agent", userAgent)
 
-	resp, err := p.client.Do(req)
+	resp, err := p.upstreamClient.Do(req)
 	if err != nil {
 		http.Error(w, "upstream request failed: "+err.Error(), http.StatusBadGateway)
 		return
@@ -199,7 +231,7 @@ func (p *Proxy) serveFromUpstream(w http.ResponseWriter, r *http.Request, upstre
 				req.Header.Set("User-Agent", userAgent)
 				req.Header.Set("Authorization", "Bearer "+token)
 
-				resp, err = p.client.Do(req)
+				resp, err = p.upstreamClient.Do(req)
 				if err != nil {
 					http.Error(w, "upstream retry failed: "+err.Error(), http.StatusBadGateway)
 					return
@@ -263,7 +295,7 @@ func (p *Proxy) fetchToken(wwwAuth, repo string) string {
 	}
 
 	tokenURL := realm + "?" + q.Encode()
-	resp, err := p.client.Get(tokenURL)
+	resp, err := p.upstreamClient.Get(tokenURL)
 	if err != nil {
 		log.Printf("fetch token failed: %v", err)
 		return ""
@@ -393,6 +425,35 @@ func (p *Proxy) uploadBlobToCache(repo, digest string, body io.Reader) {
 	}
 	putResp.Body.Close()
 	log.Printf("Cached blob %s/%s to cache, status: %d\n", repo, digest, putResp.StatusCode)
+}
+
+// parseNoProxy 解析逗号分隔的 NO_PROXY 列表
+func parseNoProxy(noProxy string) []string {
+	if noProxy == "" {
+		return nil
+	}
+	items := strings.Split(noProxy, ",")
+	result := make([]string, 0, len(items))
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item != "" {
+			result = append(result, item)
+		}
+	}
+	return result
+}
+
+// matchNoProxy 检查 host 是否匹配 no_proxy 规则
+// 规则：
+//   - ".example.com" 匹配所有 *.example.com 的子域名
+//   - "example.com" 精确匹配 example.com
+func matchNoProxy(host, pattern string) bool {
+	host = strings.TrimSuffix(host, ".")
+	pattern = strings.TrimSuffix(pattern, ".")
+	if strings.HasPrefix(pattern, ".") {
+		return strings.HasSuffix(host, pattern) || host == pattern[1:]
+	}
+	return host == pattern
 }
 
 // copyHeaders 安全地复制 HTTP 头
